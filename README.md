@@ -1,194 +1,170 @@
-# README — Usage & Code Examples
+# pie-minimal-batcher
 
-This document shows **how to run** the project with the provided scripts **and** how to use the **code** (framework-agnostic and Laravel).
+A **minimal PHP batching system** built on RabbitMQ.
+It shards messages across workers, applies per-identity cooldowns, and flushes batches on fixed-time windows.
 
----
-
-## Shell Usage (Docker + Composer)
-
-### 0) First run: bring up containers & install deps
-
-```bash
-bash run/up.sh
-# Builds the PHP image, starts RabbitMQ + PHP containers,
-# and runs `composer install` inside the PHP container.
-```
-
-### 1) Initialize RabbitMQ (least privilege)
-
-```bash
-bash run/init-rabbit.sh
-# Creates /pie vhost and a least-privileged user (pie_user).
-```
-
-### 2) Run tests (Pest)
-
-```bash
-bash run/test.sh
-# Ensures dependencies and then runs `composer test` inside the PHP container.
-```
-
-### 3) Start shard workers (parallel processing)
-
-```bash
-bash run/workers.sh
-# Launches 10 shard workers in detached containers.
-# Each worker runs: php scripts/worker.php <shardId>
-```
-
-### 4) Publish demo messages
-
-```bash
-bash run/publish-demo.sh        # default 50 messages
-bash run/publish-demo.sh 200    # publish 200 messages
-# Publishes messages with routing keys shard-0..shard-9 to RabbitMQ.
-```
-
-### 5) Tear down
-
-```bash
-bash run/down.sh
-# Stops and removes containers, networks, and volumes.
-```
-
-### Composer (manual, inside container)
-
-```bash
-# Install dependencies
-docker compose run --rm php bash -lc 'composer install --no-interaction'
-
-# Run tests
-docker compose run --rm php bash -lc 'composer test'
-```
+Ideal for payout / withdrawal pipelines or any workload that benefits from **sharded batch processing with cooldown logic**.
 
 ---
 
-## Code Usage (Framework-agnostic PHP)
+## ✨ Features
 
-### Publish messages
+* **RabbitMQ publisher & consumer**
+
+  * Direct exchange: `payout.direct`
+  * Shard queues: `payout.shard.{id}`
+  * Publisher confirms enabled (guaranteed delivery)
+  * Optional quorum queues for durability
+
+* **Worker**
+
+  * Processes 1 shard at a time
+  * Drains up to 256 msgs per tick
+  * Filters by cooldown (per identity)
+  * Flushes only on **fixed window rotation**
+  * Custom sinks via `BatchSinkInterface`
+
+* **Cooldown Registry**
+
+  * Backed by SQLite (`pdo_sqlite`)
+  * Expired entries auto-cleaned
+
+* **Laravel Integration**
+
+  * `PieServiceProvider` + `Pie` facade
+  * `publish()`, `setCooldown()`, `tick()` exposed
+  * Uses `storage/app/pie` for state & output
+
+* **Dockerized**
+
+  * Comes with `docker-compose.yaml`
+  * Scripts for RabbitMQ setup, worker launch, demo publishing
+
+---
+
+## 🚀 Quickstart (Docker)
+
+1. **Start services & install deps**
+
+   ```bash
+   bash run/up.sh
+   ```
+
+2. **Initialize RabbitMQ**
+
+   ```bash
+   bash run/init-rabbit.sh
+   ```
+
+   Creates `/pie` vhost and `pie_user/pie_pass` with limited rights.
+
+3. **Start 10 shard workers**
+
+   ```bash
+   bash run/workers.sh
+   ```
+
+4. **Publish demo messages**
+
+   ```bash
+   bash run/publish-demo.sh        # 50 messages
+   bash run/publish-demo.sh 200    # 200 messages
+   ```
+
+5. **Check outputs**
+   Look in `var/out_shard_*.ndjson` for summaries like:
+
+   ```json
+   {"shard":3,"window_start":1700000000,"window_sec":3600,"count":42}
+   ```
+
+---
+
+## 📦 Usage in Your Own Code
+
+### Publisher
 
 ```php
-<?php
-declare(strict_types=1);
-
-require __DIR__.'/vendor/autoload.php';
-
-use Tetthys\Pie\Infra\Rabbit\RabbitConnection;
-use Tetthys\Pie\Infra\Rabbit\RabbitPublisher;
-
-// 1) Connect (env or defaults)
-$host  = getenv('PIE_RMQ_HOST') ?: 'rabbit';
-$port  = (int)(getenv('PIE_RMQ_PORT') ?: 5672);
-$user  = getenv('PIE_RMQ_USER') ?: 'pie_user';
-$pass  = getenv('PIE_RMQ_PASS') ?: 'pie_pass';
-$vhost = getenv('PIE_RMQ_VHOST') ?: '/pie';
-
-// 2) Publisher to a direct exchange
-$exchange = getenv('PIE_RMQ_EXCHANGE') ?: 'payout.direct';
 $conn = new RabbitConnection($host, $port, $user, $pass, $vhost);
-$pub  = new RabbitPublisher($conn, $exchange);
+$pub  = new RabbitPublisher($conn, 'payout.direct');
 
-// 3) Simple shard function
-$shardCount = 10;
-$shardOf = static fn(string $identity): int => abs(crc32($identity)) % $shardCount;
-
-// 4) Publish a message
 $identity = 'ACC-12345';
-$routingKey = 'shard-'.$shardOf($identity);
+$shard = abs(crc32($identity)) % 10;
 
-$msg = [
+$pub->publish([
   'identity' => $identity,
-  'payload'  => ['amount_minor' => 12500], // opaque bank-agnostic payload
+  'payload'  => ['amount_minor' => 12500],
   'uuid'     => bin2hex(random_bytes(8)),
-];
-
-$pub->publish($msg, $routingKey);
-echo "Published to {$routingKey}\n";
+], "shard-$shard");
 ```
 
-### Run a worker (1 shard)
+### Worker
 
 ```php
-<?php
-declare(strict_types=1);
+$consumer = new RabbitConsumer($conn, 'payout.direct', "payout.shard.$id", "shard-$id", 100, false);
+$sink     = new FileLogSink(__DIR__."/var/out_shard_{$id}.ndjson");
+$cool     = new SqliteCooldownRegistry(__DIR__.'/var/cooldowns.sqlite');
+$worker   = new ShardedBatchWorker($id, $consumer, $sink, $cool, new SystemClock(), 3600);
 
-require __DIR__.'/vendor/autoload.php';
-
-use Tetthys\Pie\Infra\Rabbit\RabbitConnection;
-use Tetthys\Pie\Infra\Rabbit\RabbitConsumer;
-use Tetthys\Pie\Support\SqliteCooldownRegistry;
-use Tetthys\Pie\Support\SystemClock;
-use Tetthys\Pie\Sink\FileLogSink;
-use Tetthys\Pie\Worker\ShardedBatchWorker;
-
-// 1) Dependencies
-$shardId   = (int)($argv[1] ?? 0);
-$host      = getenv('PIE_RMQ_HOST') ?: 'rabbit';
-$port      = (int)(getenv('PIE_RMQ_PORT') ?: 5672);
-$user      = getenv('PIE_RMQ_USER') ?: 'pie_user';
-$pass      = getenv('PIE_RMQ_PASS') ?: 'pie_pass';
-$vhost     = getenv('PIE_RMQ_VHOST') ?: '/pie';
-$exchange  = getenv('PIE_RMQ_EXCHANGE') ?: 'payout.direct';
-$prefetch  = (int)(getenv('PIE_RMQ_PREFETCH') ?: 128);
-$windowSec = (int)(getenv('PIE_WINDOW_SEC') ?: 3600);
-
-// 2) Compose components
-$clock = new SystemClock();
-$registry = new SqliteCooldownRegistry(__DIR__.'/var/cooldowns.sqlite');
-
-$conn = new RabbitConnection($host, $port, $user, $pass, $vhost);
-$queue = "payout.shard.$shardId";
-$rkey  = "shard-$shardId";
-$consumer = new RabbitConsumer($conn, $exchange, $queue, $rkey, $prefetch, false);
-
-// Minimal sink example (NDJSON with batch metadata)
-$sink = new FileLogSink(__DIR__."/var/out_shard_{$shardId}.ndjson");
-
-// 3) Worker
-$worker = new ShardedBatchWorker($shardId, $consumer, $sink, $registry, $clock, $windowSec);
-
-// 4) Loop
 while (true) {
-    $worker->tick();       // drain messages, flush on window boundary
-    usleep(1000 * 200);    // small sleep to avoid a hot loop
+    $worker->tick();
+    usleep(100 * 1000); // adjust polling interval
 }
 ```
 
 ---
 
-## Code Usage (Laravel)
+## 🕊 Laravel Integration
 
-> Register the provider once, then use the `Pie` facade.
+1. Register the provider:
 
-### Register provider
+   ```php
+   // config/app.php
+   'providers' => [
+       Tetthys\Pie\Laravel\PieServiceProvider::class,
+   ],
+   ```
 
-```php
-// config/app.php
-'providers' => [
-    // ...
-    Tetthys\Pie\Laravel\PieServiceProvider::class,
-],
-```
+2. Use the facade:
 
-### Use the facade
+   ```php
+   use Tetthys\Pie\Laravel\Facades\Pie;
 
-```php
-<?php
-// e.g., in a controller/command/job
-use Tetthys\Pie\Laravel\Facades\Pie;
+   // publish a message
+   Pie::publish([
+     'identity' => 'ACC-12345',
+     'payload'  => ['amount_minor' => 12500],
+     'uuid'     => bin2hex(random_bytes(8)),
+   ], 'shard-3');
 
-// Publish a message
-Pie::publish([
-  'identity' => 'ACC-12345',
-  'payload'  => ['amount_minor' => 12500],
-  'uuid'     => bin2hex(random_bytes(8)),
-], 'shard-3');
+   // set a cooldown (1h)
+   Pie::setCooldown('ACC-12345', time() + 3600);
 
-// Set per-identity cooldown (e.g., 1 hour)
-Pie::setCooldown('ACC-12345', time() + 3600);
+   // tick a shard worker
+   Pie::tick(3);
+   ```
 
-// Tick a shard worker once (cron/scheduler)
-Pie::tick(3);
-```
+3. Long-running workers
+   Wrap `Pie::tick($shardId)` in an Artisan command loop and run it under Supervisor/systemd.
 
-> For long-running workers, create an Artisan command that calls `Pie::tick($shardId)` in a loop, similar to the framework-agnostic example.
+---
+
+## ⚠ Notes & Caveats
+
+* **Prefetch setting**: current consumer uses `basic_get` (polling). Prefetch has **no effect** unless converted to `basic_consume`.
+* **Cooldown storage**:
+
+  * Standalone: `var/cooldowns.sqlite`
+  * Laravel: `storage/app/pie/cooldowns.sqlite`
+* **Polling delay**: workers use `usleep(100–200ms)`. Adjust to balance throughput vs latency.
+* **Message size**: publisher enforces **64KB limit**. Store large payloads externally.
+* **Sharding**: always hash by `identity` so cooldown guarantees are shard-local.
+
+---
+
+## ✅ Best Practice Flow
+
+1. **Publish** messages with identity-based shard routing.
+2. **Worker** batches per shard, flushes on window boundary.
+3. **Sink** executes the real action (e.g., payout API call).
+4. **Cooldown** is set per identity to avoid duplicate handling.
