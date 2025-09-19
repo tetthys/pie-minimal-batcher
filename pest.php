@@ -1,0 +1,2 @@
+<?php
+// Minimal Pest bootstrap.
